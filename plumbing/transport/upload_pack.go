@@ -253,7 +253,7 @@ func UploadPack(
 		return fmt.Errorf("closing reader: %w", err)
 	}
 
-	objs, err := objectsToUpload(st, wants, haves)
+	objs, err := objectsToUpload(st, wants, haves, upreq.Shallows, upreq.Depth)
 	if err != nil {
 		_ = w.Close()
 		return fmt.Errorf("getting objects to upload: %w", err)
@@ -301,8 +301,88 @@ func UploadPack(
 	return nil
 }
 
-func objectsToUpload(st storage.Storer, wants, haves []plumbing.Hash) ([]plumbing.Hash, error) {
-	return revlist.Objects(st, wants, haves)
+func objectsToUpload(
+	st storage.Storer,
+	wants, haves, clientShallows []plumbing.Hash,
+	depth packp.Depth,
+) ([]plumbing.Hash, error) {
+	serverBoundaryParents := []plumbing.Hash(nil)
+	if !depth.IsZero() {
+		var shupd packp.ShallowUpdate
+		switch d := depth.(type) {
+		case packp.DepthCommits:
+			if err := getShallowCommits(st, wants, int(d), &shupd); err != nil {
+				return nil, err
+			}
+		default:
+			return nil, fmt.Errorf("unsupported depth type %T", depth)
+		}
+
+		var err error
+		serverBoundaryParents, err = shallowBoundaryParents(st, shupd.Shallows)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if len(serverBoundaryParents) == 0 && len(clientShallows) == 0 {
+		return revlist.Objects(st, wants, haves)
+	}
+
+	wanted, err := revlist.Objects(st, wants, serverBoundaryParents)
+	if err != nil {
+		return nil, err
+	}
+
+	clientBoundaryParents, err := shallowBoundaryParents(st, clientShallows)
+	if err != nil {
+		return nil, err
+	}
+
+	had := make(map[plumbing.Hash]struct{}, len(haves))
+	if len(haves) > 0 {
+		existing, err := revlist.Objects(st, haves, clientBoundaryParents)
+		if err != nil {
+			return nil, err
+		}
+		for _, h := range existing {
+			had[h] = struct{}{}
+		}
+	}
+
+	objs := make([]plumbing.Hash, 0, len(wanted))
+	for _, h := range wanted {
+		if _, ok := had[h]; ok {
+			continue
+		}
+		objs = append(objs, h)
+	}
+
+	return objs, nil
+}
+
+func shallowBoundaryParents(st storage.Storer, shallows []plumbing.Hash) ([]plumbing.Hash, error) {
+	if len(shallows) == 0 {
+		return nil, nil
+	}
+
+	parents := make(map[plumbing.Hash]struct{})
+	for _, h := range shallows {
+		commit, err := object.GetCommit(st, h)
+		if err != nil {
+			return nil, err
+		}
+		for _, parent := range commit.ParentHashes {
+			parents[parent] = struct{}{}
+		}
+	}
+
+	result := make([]plumbing.Hash, 0, len(parents))
+	for h := range parents {
+		result = append(result, h)
+	}
+
+	return result, nil
 }
 
 func getShallowCommits(st storage.Storer, heads []plumbing.Hash, depth int, upd *packp.ShallowUpdate) error {

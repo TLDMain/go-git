@@ -2003,3 +2003,91 @@ func writeCommitToRef(t *testing.T, repo *Repository, refName string, treeID plu
 
 	return commitID
 }
+
+func TestFetchLightweightTagIntoShallowRepo(t *testing.T) {
+	t.Parallel()
+
+	setTagRef := func(repo *Repository, tag string, target plumbing.Hash) {
+		t.Helper()
+		ref := plumbing.NewHashReference(plumbing.ReferenceName("refs/tags/"+tag), target)
+		if err := repo.Storer.SetReference(ref); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	tempDir := t.TempDir()
+	remoteDir := filepath.Join(tempDir, "remote.git")
+	remoteRepo, err := PlainInit(remoteDir, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	treeID := writeEmptyTree(t, remoteRepo)
+	start := time.Unix(1_700_000_000, 0).UTC()
+
+	c1 := writeCommitToRef(t, remoteRepo, "refs/heads/main", treeID, start)
+	setTagRef(remoteRepo, "v1.0.0", c1)
+	c2 := writeCommitToRef(t, remoteRepo, "refs/heads/main", treeID, start.Add(time.Second))
+	setTagRef(remoteRepo, "v2.0.0", c2)
+	_ = writeCommitToRef(t, remoteRepo, "refs/heads/main", treeID, start.Add(2*time.Second))
+	c4 := writeCommitToRef(t, remoteRepo, "refs/heads/main", treeID, start.Add(3*time.Second))
+	setTagRef(remoteRepo, "v3.0.0", c4)
+	_ = writeCommitToRef(t, remoteRepo, "refs/heads/main", treeID, start.Add(4*time.Second))
+	c6 := writeCommitToRef(t, remoteRepo, "refs/heads/main", treeID, start.Add(5*time.Second))
+	setTagRef(remoteRepo, "v4.0.0", c6)
+	_ = writeCommitToRef(t, remoteRepo, "refs/heads/main", treeID, start.Add(6*time.Second))
+	if err := remoteRepo.Storer.SetReference(plumbing.NewSymbolicReference(plumbing.HEAD, "refs/heads/main")); err != nil {
+		t.Fatal(err)
+	}
+
+	repo, err := PlainInit(filepath.Join(tempDir, "fetch"), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.CreateRemote(&config.RemoteConfig{
+		Name: DefaultRemoteName,
+		URLs: []string{remoteDir},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	err = repo.Fetch(&FetchOptions{
+		RemoteName: DefaultRemoteName,
+		Depth:      3,
+		Tags:       NoTags,
+		RefSpecs: []config.RefSpec{
+			config.RefSpec("+refs/heads/main:refs/remote/origin/main"),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.Storer.SetReference(plumbing.NewHashReference(plumbing.HEAD, c6)); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := repo.CommitObject(c2); !errors.Is(err, plumbing.ErrObjectNotFound) {
+		t.Fatalf("expected v2 commit to be absent in shallow clone, got: %v", err)
+	}
+
+	err = repo.Fetch(&FetchOptions{
+		RemoteName: "origin",
+		Depth:      1,
+		RefSpecs: []config.RefSpec{
+			config.RefSpec("+refs/tags/v2.0.0:refs/tags/v2.0.0"),
+		},
+	})
+	if err != nil {
+		t.Fatalf("fetch tag failed: %v", err)
+	}
+
+	ref, err := repo.Reference(plumbing.ReferenceName("refs/tags/v2.0.0"), true)
+	if err != nil {
+		t.Fatalf("tag ref missing after fetch: %v", err)
+	}
+	if ref.Hash() != c2 {
+		t.Fatalf("tag ref hash = %s, want %s", ref.Hash(), c2)
+	}
+
+	if _, err := repo.CommitObject(ref.Hash()); err != nil {
+		t.Fatalf("tag target commit missing after fetch: %v", err)
+	}
+}
